@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+matplotlib
+scikit-learn
+xgboost
+lightgbm
+pymoo==0.6.0
+joblib
+shap
+openpyxl
