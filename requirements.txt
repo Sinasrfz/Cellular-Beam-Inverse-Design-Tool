@@ -8,3 +8,4 @@ lightgbm
 xgboost
 pymoo
 scikit-learn
+openpyxl
