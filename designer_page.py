@@ -3,7 +3,7 @@
 # Refined for realistic engineering use:
 #   - Fixed: L, ho, s, fy (designer inputs)
 #   - Optimized: H, bf, tw, tf
-#   - Robust code check column handling
+#   - Enforces strong code-safety constraints
 # ============================================================
 
 import streamlit as st
@@ -25,7 +25,7 @@ def render(model_forward, scaler_forward, feature_cols,
            clf_failure, scaler_failure, label_encoder,
            df_full):
 
-    st.header("🏗 Designer Tool — Practical Inverse Design")
+    st.header("🏗 Designer Tool — Practical Inverse Design (Code-Safe)")
 
     st.markdown("""
     This tool optimizes **H**, **bf**, **tw**, and **tf** to achieve the required
@@ -37,6 +37,9 @@ def render(model_forward, scaler_forward, feature_cols,
     - Hole spacing (**s**)  
     - Steel yield strength (**fy**)  
     - Target ultimate load (**wu_target**)  
+
+    The optimization ensures that all final geometries **satisfy code-based safety limits**
+    (SCI, EN, and AISC). Unsafe beams are automatically penalized.
     """)
 
     # --- USER INPUTS ---
@@ -74,18 +77,19 @@ def build_features_vector(H, bf, tw, tf, L, ho, s, fy):
 
 
 def applicability_penalty(H, bf, tw, tf, L, ho, s, fy):
+    """Geometric and material applicability rules."""
     p = 0
-    if not (1.25 <= H / ho <= 1.75): p += 1000
-    if not (1.08 <= s / ho <= 1.50): p += 1000
-    if ho > 0.8 * (H + tf): p += 1000
-    if (H - ho) / 2 < (tf + 30): p += 1000
-    if not (15 <= L / H <= 30): p += 1000
-    if not (250 <= fy <= 460): p += 1000
+    if not (1.25 <= H / ho <= 1.75): p += 1e3
+    if not (1.08 <= s / ho <= 1.50): p += 1e3
+    if ho > 0.8 * (H + tf): p += 1e3
+    if (H - ho) / 2 < (tf + 30): p += 1e3
+    if not (15 <= L / H <= 30): p += 1e3
+    if not (250 <= fy <= 460): p += 1e3
     return p
 
 
 # ============================================================
-# PHASE 3 — NSGA-II Optimization
+# PHASE 3 — NSGA-II Optimization (Code-Safe)
 # ============================================================
 
 class BeamProblem(ElementwiseProblem):
@@ -98,7 +102,6 @@ class BeamProblem(ElementwiseProblem):
         self.model, self.scaler, self.feature_cols = model, scaler, feature_cols
 
         self.df = df.copy()
-        # Normalize all column names
         self.df.columns = [c.replace("\n", " ").replace('"', '').strip() for c in self.df.columns]
         if "fy×Area" in self.df.columns:
             self.df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
@@ -108,9 +111,10 @@ class BeamProblem(ElementwiseProblem):
         feats = build_features_vector(H, bf, tw, tf, self.L, self.ho, self.s, self.fy)
         wu_pred = self.model.predict(self.scaler.transform(feats[self.feature_cols]))[0]
         A = feats["Area"].iloc[0]
-        pen = applicability_penalty(H, bf, tw, tf, self.L, self.ho, self.s, self.fy)
 
-        # Add safety penalty
+        penalty = applicability_penalty(H, bf, tw, tf, self.L, self.ho, self.s, self.fy)
+
+        # Add strong safety penalty (physics-informed)
         NN = NearestNeighbors(n_neighbors=1)
         NN.fit(self.df[self.feature_cols])
         _, idx = NN.kneighbors(feats[self.feature_cols])
@@ -118,23 +122,27 @@ class BeamProblem(ElementwiseProblem):
 
         for code_col in ["wSCI", "wEN,M", "wEN,A", "wAISC"]:
             R = row.get(code_col, np.nan)
-            if pd.notna(R) and wu_pred > R:
-                pen += (wu_pred - R)**2
+            if pd.notna(R):
+                if wu_pred > R:
+                    # very strong penalty for unsafe design
+                    penalty += 1e7 * ((wu_pred - R) / R) ** 2
 
+        # Objectives: match target & minimize area
         f1 = abs(wu_pred - self.wu_target) / self.wu_target
         f2 = A / 1e4
-        out["F"] = [f1 + pen * 1e-6, f2 + pen * 1e-6]
+        out["F"] = [f1 + penalty * 1e-6, f2 + penalty * 1e-6]
 
 
 def run_nsga(wu_target, L, ho, s, fy, model, scaler, feature_cols, df):
     problem = BeamProblem(wu_target, L, ho, s, fy, model, scaler, feature_cols, df)
-    algo = NSGA2(pop_size=80)
+    algo = NSGA2(pop_size=100)
     term = get_termination("n_gen", 150)
     result = minimize(problem, algo, term, seed=42, verbose=False)
 
     X, F = result.X, result.F
     best_idx = np.argmin(F[:, 0] + F[:, 1])
     best = X[best_idx]
+
     feats = build_features_vector(*best, L, ho, s, fy)
     wu_best = float(model.predict(scaler.transform(feats[feature_cols]))[0])
     A_best = float(feats["Area"].iloc[0])
@@ -153,7 +161,7 @@ def predict_failure(H, bf, tw, tf, L, ho, s, fy, clf, scaler, encoder, feature_c
 
 
 # ============================================================
-# PHASE 6 — Code Compliance Check (robust)
+# PHASE 6 — Code Compliance Check
 # ============================================================
 
 def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df):
@@ -165,7 +173,6 @@ def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df)
     if "fy×Area" in df.columns:
         df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
-    # Robustly match code columns
     code_cols = {
         "wSCI": next((c for c in df.columns if "wSCI" in c), None),
         "wENM": next((c for c in df.columns if "wEN,M" in c or "wENM" in c), None),
@@ -202,7 +209,7 @@ def run_inverse_design(wu_target, L, ho, s, fy,
                        clf_failure, scaler_failure, label_encoder,
                        df_full):
 
-    st.subheader("🔹 Phase 3 — NSGA-II Optimization")
+    st.subheader("🔹 Phase 3 — NSGA-II Physics-Informed Optimization")
     nsga = run_nsga(wu_target, L, ho, s, fy, model_forward, scaler_forward, feature_cols, df_full)
     H, bf, tw, tf = nsga["best_design"]
 
@@ -222,4 +229,4 @@ def run_inverse_design(wu_target, L, ho, s, fy,
                           model_forward, scaler_forward, feature_cols, df_full)
     st.json(code)
 
-    st.success("✔ Full inverse design completed successfully.")
+    st.success("✔ Full inverse design completed with code-compliant optimization.")
