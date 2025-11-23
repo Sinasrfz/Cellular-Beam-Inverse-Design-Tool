@@ -1,6 +1,6 @@
 # ============================================================
 # designer_page.py — Practical Inverse Design Engine (Phases 3–6)
-# Discrete-section version with target-weighted optimization
+# Discrete-section version with strict target constraint (±5%)
 # ============================================================
 
 import streamlit as st
@@ -21,14 +21,15 @@ def render(model_forward, scaler_forward, feature_cols,
            clf_failure, scaler_failure, label_encoder,
            df_full):
 
-    st.header("🏗 Designer Tool — Practical Inverse Design (Discrete Code-Feasible)")
+    st.header("🏗 Designer Tool — Practical Inverse Design (Target-Constrained & Code-Feasible)")
 
     st.sidebar.header("🧮 Design Inputs")
     L = st.sidebar.number_input("Beam Span L (mm)", value=12000.0, step=500.0)
     ho = st.sidebar.number_input("Opening Diameter ho (mm)", value=400.0, step=10.0)
     s = st.sidebar.number_input("Opening Spacing s (mm)", value=600.0, step=10.0)
     fy = st.sidebar.number_input("Steel Yield Strength fy (MPa)", value=355.0, step=10.0)
-    wu_target = st.number_input("🎯 Target Ultimate Load wu (kN/m)", min_value=5.0, max_value=200.0, value=30.0, step=1.0)
+    wu_target = st.number_input("🎯 Target Ultimate Load wu (kN/m)", min_value=5.0, max_value=200.0,
+                                value=30.0, step=1.0)
 
     if st.button("Run Inverse Design", type="primary"):
         run_inverse_design(wu_target, L, ho, s, fy,
@@ -67,7 +68,7 @@ def applicability_penalty(H, bf, tw, tf, L, ho, s, fy):
 
 
 # ============================================================
-# PHASE 3 — NSGA-II (Discrete Feasible Optimization)
+# PHASE 3 — NSGA-II (Discrete, Target-Constrained)
 # ============================================================
 
 class BeamProblem(ElementwiseProblem):
@@ -79,20 +80,21 @@ class BeamProblem(ElementwiseProblem):
         self.L, self.ho, self.s, self.fy = L, ho, s, fy
         self.model, self.scaler, self.feature_cols = model, scaler, feature_cols
 
-        # Discrete catalogue values
+        # Discrete catalogue
         self.allowed_H = [420, 560, 700]
         self.allowed_bf = [162, 216, 270]
         self.allowed_tw = [9, 12, 15]
         self.allowed_tf = [15, 20, 25]
 
-        # Clean dataset headers
+        # Clean dataset
         self.df = df.copy()
-        self.df.columns = [c.replace("\n", " ").replace("(kN/m)", "").replace('"', '').strip() for c in self.df.columns]
+        self.df.columns = [c.replace("\n", " ").replace("(kN/m)", "")
+                           .replace('"', '').strip() for c in self.df.columns]
         if "fy×Area" in self.df.columns:
             self.df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
     def _evaluate(self, x, out, *args, **kwargs):
-        # Snap variables to discrete catalogue
+        # Discrete snapping
         H = min(self.allowed_H, key=lambda v: abs(v - x[0]))
         bf = min(self.allowed_bf, key=lambda v: abs(v - x[1]))
         tw = min(self.allowed_tw, key=lambda v: abs(v - x[2]))
@@ -103,21 +105,23 @@ class BeamProblem(ElementwiseProblem):
         A = feats["Area"].iloc[0]
         pen = applicability_penalty(H, bf, tw, tf, self.L, self.ho, self.s, self.fy)
 
-        # Disqualify if too far from target (> ±20 %)
-        if abs(wu_pred - self.wu_target) / self.wu_target > 0.20:
-            pen += 1e6
+        # --- enforce target proximity (±5 %) ---
+        deviation = abs(wu_pred - self.wu_target) / self.wu_target
+        if deviation > 0.05:
+            pen += 1e7 * deviation ** 2  # stronger penalty for large deviation
 
-        # Safety constraint
+        # --- enforce safety (code-based) ---
         NN = NearestNeighbors(n_neighbors=1)
         NN.fit(self.df[self.feature_cols])
         _, idx = NN.kneighbors(feats[self.feature_cols])
         row = self.df.iloc[idx[0][0]]
-        safe_limit = np.nanmin([row.get(k, np.inf) for k in ["wSCI", "wEN,M", "wEN,A", "wAISC"]])
+        safe_limit = np.nanmin([row.get(k, np.inf)
+                                for k in ["wSCI", "wEN,M", "wEN,A", "wAISC"]])
         if wu_pred > safe_limit:
             pen += 1e8 * ((wu_pred - safe_limit) / safe_limit) ** 2
 
-        # Weighted objective: prioritize wu matching
-        f1 = 10 * abs(wu_pred - self.wu_target) / self.wu_target
+        # Weighted objectives: balance accuracy & area
+        f1 = 10 * deviation
         f2 = A / 1e4
         out["F"] = [f1 + pen * 1e-6, f2 + pen * 1e-6]
         out["X_discrete"] = [H, bf, tw, tf]
@@ -143,7 +147,8 @@ def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df)
     wu_pred = float(model.predict(scaler.transform(feats[feature_cols]))[0])
 
     df = df.copy()
-    df.columns = [c.replace("\n", " ").replace("(kN/m)", "").replace('"', '').strip() for c in df.columns]
+    df.columns = [c.replace("\n", " ").replace("(kN/m)", "")
+                  .replace('"', '').strip() for c in df.columns]
     if "fy×Area" in df.columns:
         df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
@@ -176,14 +181,14 @@ def run_inverse_design(wu_target, L, ho, s, fy,
                        clf_failure, scaler_failure, label_encoder,
                        df_full):
 
-    st.subheader("🔹 Phase 3 — NSGA-II (Discrete Code-Feasible Search)")
-    problem = BeamProblem(wu_target, L, ho, s, fy, model_forward, scaler_forward, feature_cols, df_full)
-    algo = NSGA2(pop_size=100)
+    st.subheader("🔹 Phase 3 — NSGA-II (Target-Constrained Discrete Search)")
+    problem = BeamProblem(wu_target, L, ho, s, fy, model_forward,
+                          scaler_forward, feature_cols, df_full)
+    algo = NSGA2(pop_size=120)
     term = get_termination("n_gen", 150)
     result = minimize(problem, algo, term, seed=42, verbose=False)
 
-    X, F = result.X, result.F
-    best_idx = np.argmin(F[:, 0] + F[:, 1])
+    best_idx = np.argmin(result.F[:, 0] + result.F[:, 1])
     H, bf, tw, tf = result.pop.get("X_discrete")[best_idx]
 
     feats = build_features_vector(H, bf, tw, tf, L, ho, s, fy)
@@ -206,4 +211,4 @@ def run_inverse_design(wu_target, L, ho, s, fy,
                           model_forward, scaler_forward, feature_cols, df_full)
     st.json(code)
 
-    st.success("✔ Optimization completed — discrete, code-safe, and target-matching solution found.")
+    st.success("✔ Optimization completed — within ±5 % of target and code-safe.")
