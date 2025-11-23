@@ -1,9 +1,6 @@
 # ============================================================
 # designer_page.py — Practical Inverse Design Engine (Phases 3–6)
-# Refined for realistic engineering use:
-#   - Fixed: L, ho, s, fy (designer inputs)
-#   - Optimized: H, bf, tw, tf
-#   - Enforces real code-safety by feasibility filtering
+# Fixed column-name issue in code compliance stage
 # ============================================================
 
 import streamlit as st
@@ -26,18 +23,12 @@ def render(model_forward, scaler_forward, feature_cols,
 
     st.header("🏗 Designer Tool — Practical Inverse Design (Code-Feasible)")
 
-    st.markdown("""
-    This version guarantees **code-safe** results by restricting optimization
-    to the feasible region where **wu ≤ min(wSCI, wEN,M, wEN,A, wAISC)**.
-    """)
-
     st.sidebar.header("🧮 Design Inputs")
     L = st.sidebar.number_input("Beam Span L (mm)", value=12000.0, step=500.0)
     ho = st.sidebar.number_input("Opening Diameter ho (mm)", value=400.0, step=10.0)
     s = st.sidebar.number_input("Opening Spacing s (mm)", value=600.0, step=10.0)
     fy = st.sidebar.number_input("Steel Yield Strength fy (MPa)", value=355.0, step=10.0)
-    wu_target = st.number_input("🎯 Target Ultimate Load wu (kN/m)",
-                                min_value=5.0, max_value=200.0, value=30.0, step=1.0)
+    wu_target = st.number_input("🎯 Target Ultimate Load wu (kN/m)", min_value=5.0, max_value=200.0, value=30.0, step=1.0)
 
     if st.button("Run Inverse Design", type="primary"):
         run_inverse_design(wu_target, L, ho, s, fy,
@@ -81,15 +72,14 @@ def applicability_penalty(H, bf, tw, tf, L, ho, s, fy):
 
 class BeamProblem(ElementwiseProblem):
     def __init__(self, wu_target, L, ho, s, fy, model, scaler, feature_cols, df):
-        super().__init__(n_var=4, n_obj=2,
-                         xl=np.array([300, 120, 6, 10]),
-                         xu=np.array([700, 270, 15, 25]))
+        super().__init__(n_var=4, n_obj=2, xl=np.array([300, 120, 6, 10]), xu=np.array([700, 270, 15, 25]))
         self.wu_target = wu_target
         self.L, self.ho, self.s, self.fy = L, ho, s, fy
         self.model, self.scaler, self.feature_cols = model, scaler, feature_cols
 
         self.df = df.copy()
-        self.df.columns = [c.replace("\n", " ").replace('"', '').strip() for c in self.df.columns]
+        # FIX: clean header properly including (kN/m)
+        self.df.columns = [c.replace("\n", " ").replace("(kN/m)", "").replace('"', '').strip() for c in self.df.columns]
         if "fy×Area" in self.df.columns:
             self.df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
@@ -105,7 +95,6 @@ class BeamProblem(ElementwiseProblem):
         _, idx = NN.kneighbors(feats[self.feature_cols])
         row = self.df.iloc[idx[0][0]]
 
-        # find safe threshold
         safe_limit = np.nanmin([row.get(k, np.inf) for k in ["wSCI", "wEN,M", "wEN,A", "wAISC"]])
         if wu_pred > safe_limit:
             pen += 1e8 * ((wu_pred - safe_limit) / safe_limit) ** 2
@@ -115,23 +104,8 @@ class BeamProblem(ElementwiseProblem):
         out["F"] = [f1 + pen * 1e-6, f2 + pen * 1e-6]
 
 
-def run_nsga(wu_target, L, ho, s, fy, model, scaler, feature_cols, df):
-    problem = BeamProblem(wu_target, L, ho, s, fy, model, scaler, feature_cols, df)
-    algo = NSGA2(pop_size=100)
-    term = get_termination("n_gen", 150)
-    result = minimize(problem, algo, term, seed=42, verbose=False)
-
-    X, F = result.X, result.F
-    best_idx = np.argmin(F[:, 0] + F[:, 1])
-    best = X[best_idx]
-    feats = build_features_vector(*best, L, ho, s, fy)
-    wu_best = float(model.predict(scaler.transform(feats[feature_cols]))[0])
-    A_best = float(feats["Area"].iloc[0])
-    return {"best_design": best, "wu_best": wu_best, "A_best": A_best}
-
-
 # ============================================================
-# PHASE 5 & 6 remain unchanged
+# PHASE 5 — Failure Mode Prediction
 # ============================================================
 
 def predict_failure(H, bf, tw, tf, L, ho, s, fy, clf, scaler, encoder, feature_cols):
@@ -141,11 +115,17 @@ def predict_failure(H, bf, tw, tf, L, ho, s, fy, clf, scaler, encoder, feature_c
     return encoder.inverse_transform([y])[0]
 
 
+# ============================================================
+# PHASE 6 — Code Compliance Check
+# ============================================================
+
 def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df):
     feats = build_features_vector(H, bf, tw, tf, L, ho, s, fy)
     wu_pred = float(model.predict(scaler.transform(feats[feature_cols]))[0])
+
     df = df.copy()
-    df.columns = [c.replace("\n", " ").replace('"', '').strip() for c in df.columns]
+    # FIX: same header cleaning as above
+    df.columns = [c.replace("\n", " ").replace("(kN/m)", "").replace('"', '').strip() for c in df.columns]
     if "fy×Area" in df.columns:
         df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
@@ -169,19 +149,33 @@ def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df)
     }
 
 
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
 def run_inverse_design(wu_target, L, ho, s, fy,
                        model_forward, scaler_forward, feature_cols,
                        clf_failure, scaler_failure, label_encoder,
                        df_full):
 
     st.subheader("🔹 Phase 3 — NSGA-II (Feasible Search)")
-    nsga = run_nsga(wu_target, L, ho, s, fy, model_forward, scaler_forward, feature_cols, df_full)
-    H, bf, tw, tf = nsga["best_design"]
+    problem = BeamProblem(wu_target, L, ho, s, fy, model_forward, scaler_forward, feature_cols, df_full)
+    algo = NSGA2(pop_size=100)
+    term = get_termination("n_gen", 150)
+    result = minimize(problem, algo, term, seed=42, verbose=False)
+
+    X, F = result.X, result.F
+    best_idx = np.argmin(F[:, 0] + F[:, 1])
+    best = X[best_idx]
+    H, bf, tw, tf = best
+    feats = build_features_vector(H, bf, tw, tf, L, ho, s, fy)
+    wu_best = float(model_forward.predict(scaler_forward.transform(feats[feature_cols]))[0])
+    A_best = float(feats["Area"].iloc[0])
 
     st.json({
         "Optimized Geometry": {"H": H, "bf": bf, "tw": tw, "tf": tf},
-        "Predicted wu": nsga["wu_best"],
-        "Area": nsga["A_best"]
+        "Predicted wu": wu_best,
+        "Area": A_best
     })
 
     st.subheader("🔹 Phase 5 — Failure Mode Prediction")
