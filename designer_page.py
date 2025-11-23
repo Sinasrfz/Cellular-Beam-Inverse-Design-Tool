@@ -192,32 +192,57 @@ def predict_failure(H, bf, tw, tf, L, ho, s, fy, clf, scaler, encoder, feature_c
 # PHASE 6 — Code Compliance Check
 # ============================================================
 
+# ============================================================
+# PHASE 6 — Code Compliance Check (robust version)
+# ============================================================
+
 def run_code_check(H, bf, tw, tf, L, ho, s, fy, model, scaler, feature_cols, df):
+    """Robust Phase-6 code-check using tolerant column matching."""
     feats = build_features_vector(H, bf, tw, tf, L, ho, s, fy)
     wu_pred = float(model.predict(scaler.transform(feats[feature_cols]))[0])
 
-    cols_needed = [c for c in df.columns if any(key in c for key in ["wSCI", "wENM", "wENA", "wAISC"])]
-    df_subset = df.dropna(subset=cols_needed).copy()
+    # Temporarily clean column headers in df
+    df_cols = {c: str(c).replace("\n", " ").replace('"', '').strip() for c in df.columns}
+    df = df.rename(columns=df_cols)
 
+    # Flexible search patterns for resistance columns
+    def find_col(keyword):
+        for c in df.columns:
+            if keyword.lower() in c.lower():
+                return c
+        return None
+
+    col_sci  = find_col("wSCI")
+    col_enm  = find_col("wEN,M")
+    col_ena  = find_col("wEN,A")
+    col_aisc = find_col("wAISC")
+
+    # Safely fit nearest neighbor model
+    existing_cols = [c for c in feature_cols if c in df.columns]
+    if not existing_cols:
+        st.error("⚠ Feature columns not found in dataset.")
+        return {}
+
+    from sklearn.neighbors import NearestNeighbors
     NN = NearestNeighbors(n_neighbors=1)
-    NN.fit(df_subset[feature_cols])
-    dist, idx = NN.kneighbors(feats[feature_cols])
-    row = df_subset.iloc[idx[0][0]]
+    NN.fit(df[existing_cols])
+    dist, idx = NN.kneighbors(feats[existing_cols])
+    row = df.iloc[idx[0][0]]
 
-    def safe(wu_pred, R): return bool(wu_pred <= R if not pd.isna(R) else False)
+    def safe(pred, val):
+        return bool(pred <= val) if pd.notna(val) else False
 
     return {
         "wu_pred": wu_pred,
-        "wSCI": float(row.get("wSCI", np.nan)),
-        "wENM": float(row.get("wENM", np.nan)),
-        "wENA": float(row.get("wENA", np.nan)),
-        "wAISC": float(row.get("wAISC", np.nan)),
-        "Safe_SCI": safe(wu_pred, row.get("wSCI", np.nan)),
-        "Safe_ENM": safe(wu_pred, row.get("wENM", np.nan)),
-        "Safe_ENA": safe(wu_pred, row.get("wENA", np.nan)),
-        "Safe_AISC": safe(wu_pred, row.get("wAISC", np.nan))
+        "wSCI":  float(row.get(col_sci,  np.nan)),
+        "wENM":  float(row.get(col_enm,  np.nan)),
+        "wENA":  float(row.get(col_ena,  np.nan)),
+        "wAISC": float(row.get(col_aisc, np.nan)),
+        "Safe_SCI":  safe(wu_pred, row.get(col_sci,  np.nan)),
+        "Safe_ENM":  safe(wu_pred, row.get(col_enm,  np.nan)),
+        "Safe_ENA":  safe(wu_pred, row.get(col_ena,  np.nan)),
+        "Safe_AISC": safe(wu_pred, row.get(col_aisc, np.nan)),
     }
-
 
 # ============================================================
 # MAIN EXECUTION PIPELINE
@@ -258,3 +283,4 @@ def run_inverse_design(wu_target, L, ho, s, fy,
     st.json(code)
 
     st.success("✔ Full inverse design completed successfully.")
+
