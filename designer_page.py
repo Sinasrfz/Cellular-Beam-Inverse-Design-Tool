@@ -6,8 +6,6 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import joblib
-import json
 from pymoo.optimize import minimize
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import ElementwiseProblem
@@ -29,7 +27,7 @@ def render(model_forward, scaler_forward, feature_cols,
     - Run **NSGA-II** multi-objective optimization (Phase 3)
     - Predict **failure mode** (Phase 5)
     - Perform **SCI / EN / AISC code checks** (Phase 6)
-    - Ensure **designs respect all code safety constraints**
+    - Enforce **designs that satisfy all code-based safety rules**
     """)
 
     wu_target = st.number_input("Target ultimate load wu (kN/m):", min_value=1.0, step=1.0)
@@ -72,7 +70,7 @@ def applicability_penalty(x):
     return p
 
 # ============================================================
-# PHASE 3 — Physics-Informed NSGA-II (Main Optimization)
+# PHASE 3 — Physics-Informed NSGA-II (with safety constraints)
 # ============================================================
 
 class BeamProblem(ElementwiseProblem):
@@ -84,10 +82,10 @@ class BeamProblem(ElementwiseProblem):
         self.model = model_forward
         self.scaler = scaler_forward
         self.feature_cols = feature_cols
-        self.df = df.copy()
 
-        # prepare database for code lookup
-        self.df.columns = [c.replace("\n", " ").replace('"','').strip() for c in self.df.columns]
+        # Prepare DB for code safety check
+        self.df = df.copy()
+        self.df.columns = [c.replace("\n", " ").replace('"', '').strip() for c in self.df.columns]
         if "fy×Area" in self.df.columns:
             self.df.rename(columns={"fy×Area": "fy_Area"}, inplace=True)
 
@@ -95,27 +93,24 @@ class BeamProblem(ElementwiseProblem):
         feats = build_features_vector(*x)
         wu_pred = self.model.predict(self.scaler.transform(feats[self.feature_cols]))[0]
         A = feats["Area"].iloc[0]
+        pen = applicability_penalty(x)
 
-        # get nearest database row for code values
+        # Get nearest neighbor for code values
         NN = NearestNeighbors(n_neighbors=1)
         NN.fit(self.df[self.feature_cols])
         dist, idx = NN.kneighbors(feats[self.feature_cols])
         row = self.df.iloc[idx[0][0]]
 
-        # penalties if unsafe
-        penalty = applicability_penalty(x)
-        for code in ["wSCI", "wEN,M", "wEN,A", "wAISC"]:
-            R = row.get(code, np.nan)
+        # Add penalties for unsafe (wu_pred > code resistance)
+        for code_col in ["wSCI", "wEN,M", "wEN,A", "wAISC"]:
+            R = row.get(code_col, np.nan)
             if pd.notna(R) and wu_pred > R:
-                penalty += (wu_pred - R)**2
+                pen += (wu_pred - R)**2
 
-        # objectives: match target, minimize area
-        f1 = abs(wu_pred - self.wu_target)/self.wu_target
+        # Objectives: target matching + area minimization
+        f1 = abs(wu_pred - self.wu_target) / self.wu_target
         f2 = A / 1e4
-
-        out["F"] = [f1 + penalty*1e-6, f2 + penalty*1e-6]
-        out["wu_pred"] = wu_pred
-        out["Area"] = A
+        out["F"] = [f1 + pen * 1e-6, f2 + pen * 1e-6]
 
 def run_nsga(wu_target, model_forward, scaler_forward, feature_cols, df):
     problem = BeamProblem(wu_target, model_forward, scaler_forward, feature_cols, df)
@@ -123,9 +118,8 @@ def run_nsga(wu_target, model_forward, scaler_forward, feature_cols, df):
     term = get_termination("n_gen", 120)
     result = minimize(problem, algo, term, seed=1, verbose=False)
 
-    X = result.X
-    F = result.F
-    best_idx = np.argmin(F[:,0] + F[:,1])
+    X, F = result.X, result.F
+    best_idx = np.argmin(F[:, 0] + F[:, 1])
     best = X[best_idx]
     feats = build_features_vector(*best)
     wu_best = float(model_forward.predict(scaler_forward.transform(feats[feature_cols]))[0])
